@@ -25,9 +25,12 @@ jobs:
           python -m playwright install --with-deps chromium
 
       - name: Fetch prices
+        id: fetch
+        continue-on-error: true
         run: python fetch_prices.py --input parts.txt --output output.json
 
       - name: Commit latest JSON
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -36,3 +39,7 @@ jobs:
             git commit -m "Update Amayama prices"
             git push
           fi
+
+      - name: Fail workflow if fetch failed
+        if: steps.fetch.outcome == 'failure'
+        run: exit 1

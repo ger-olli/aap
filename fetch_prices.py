@@ -57,6 +57,24 @@ async def save_debug(page: Page, label: str) -> None:
         pass
 
 
+async def assert_not_cloudflare(page: Page) -> None:
+    body = (await page.locator("body").inner_text()).lower()
+    markers = (
+        "cloudflare",
+        "sicherheitsüberprüfung wird durchgeführt",
+        "security verification",
+        "checking if the site connection is secure",
+        "verify you are human",
+        "überprüft, dass sie kein bot sind",
+    )
+    if any(marker in body for marker in markers):
+        await save_debug(page, "cloudflare-challenge")
+        raise RuntimeError(
+            "Amayama returned a Cloudflare bot-protection challenge. "
+            "GitHub-hosted Actions cannot reliably access the product page; output.json was cleared."
+        )
+
+
 async def accept_cookies(page: Page) -> None:
     for label in ("Reject", "Accept", "Reject all", "Accept all"):
         loc = page.get_by_role("button", name=label, exact=True)
@@ -119,8 +137,6 @@ async def click_visible_text(page: Page, text: str) -> bool:
 
 
 async def try_open_selects_until_germany(page: Page) -> bool:
-    # The Amayama page exposes the destination chooser as a generic "Select"
-    # control in some layouts. Try each visible one and look for Germany.
     selectors = [
         page.get_by_text("Select", exact=True),
         page.get_by_role("button", name=re.compile(r"select", re.I)),
@@ -151,10 +167,8 @@ async def try_open_selects_until_germany(page: Page) -> bool:
 async def set_country_germany(page: Page) -> None:
     if await country_is_germany(page):
         return
-
     if await select_native_option(page, "Germany") and await country_is_germany(page):
         return
-
     body = await page.locator("body").inner_text()
     m = re.search(r"Shipping to\s+([^\n\[]+)", body, re.I)
     if m:
@@ -164,11 +178,8 @@ async def set_country_germany(page: Page) -> None:
                 await page.wait_for_timeout(1500)
                 if await country_is_germany(page):
                     return
-
     if await try_open_selects_until_germany(page):
         return
-
-    # Last resort: searchable country popup/input.
     inputs = page.locator("input")
     for i in range(await inputs.count()):
         inp = inputs.nth(i)
@@ -186,7 +197,6 @@ async def set_country_germany(page: Page) -> None:
                         return
         except Exception:
             pass
-
     await save_debug(page, "country-selection-failed")
     raise RuntimeError("Could not set shipping country to Germany")
 
@@ -210,6 +220,7 @@ async def set_germany_eur(page: Page) -> None:
 
 
 async def verify_germany_eur(page: Page) -> None:
+    await assert_not_cloudflare(page)
     if not await country_is_germany(page):
         raise RuntimeError("Shipping destination is not Germany")
     if not await currency_is_eur(page):
@@ -263,6 +274,8 @@ async def parse_offer_tables(page: Page) -> list[dict[str, Any]]:
 
 async def fetch_part(page: Page, brand: str, part_number: str, first: bool) -> dict[str, Any]:
     await page.goto(BASE_URL.format(brand=brand, part_number=part_number), wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(1200)
+    await assert_not_cloudflare(page)
     await accept_cookies(page)
     if first:
         await set_germany_eur(page)

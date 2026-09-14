@@ -7,10 +7,11 @@ import re
 from pathlib import Path
 from typing import Any
 
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import Page, async_playwright
 
 BASE_URL = "https://www.amayama.com/en/part/{brand}/{part_number}"
 PRICE_RE = re.compile(r"(?:^|\s)(\d[\d.,]*)\s*(?:EUR|€)?(?:\s|$)")
+DEBUG_DIR = Path("debug")
 
 
 def normalize_number(value: str) -> float | None:
@@ -32,12 +33,36 @@ def normalize_number(value: str) -> float | None:
         return None
 
 
+async def save_debug(page: Page, label: str) -> None:
+    DEBUG_DIR.mkdir(exist_ok=True)
+    try:
+        await page.screenshot(path=str(DEBUG_DIR / f"{label}.png"), full_page=True)
+    except Exception:
+        pass
+    try:
+        (DEBUG_DIR / f"{label}.html").write_text(await page.content(), encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        body = await page.locator("body").inner_text()
+        (DEBUG_DIR / f"{label}.txt").write_text(body, encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        controls = await page.locator("a,button,input,select,[role=button],[role=combobox]").evaluate_all(
+            "els => els.map((e,i)=>({i,tag:e.tagName,text:(e.innerText||e.value||e.getAttribute('aria-label')||'').trim(),href:e.href||null,name:e.name||null,id:e.id||null,class:e.className||null})).filter(x=>x.text)"
+        )
+        (DEBUG_DIR / f"{label}-controls.json").write_text(json.dumps(controls, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 async def accept_cookies(page: Page) -> None:
-    for label in ("Reject", "Accept"):
-        button = page.get_by_role("button", name=label, exact=True)
-        if await button.count():
+    for label in ("Reject", "Accept", "Reject all", "Accept all"):
+        loc = page.get_by_role("button", name=label, exact=True)
+        if await loc.count():
             try:
-                await button.first.click(timeout=1500)
+                await loc.first.click(timeout=1500)
                 return
             except Exception:
                 pass
@@ -52,95 +77,130 @@ async def select_native_option(page: Page, needle: str) -> bool:
             text = (await options.nth(j).inner_text()).strip()
             if needle.lower() in text.lower():
                 value = await options.nth(j).get_attribute("value")
-                if value is not None:
-                    try:
+                try:
+                    if value is not None:
                         await select.select_option(value=value)
-                        await page.wait_for_timeout(1000)
-                        return True
-                    except Exception:
-                        pass
+                    else:
+                        await select.select_option(label=text)
+                    await page.wait_for_timeout(1200)
+                    return True
+                except Exception:
+                    pass
     return False
 
 
-async def click_first_visible_text(page: Page, text: str, exact: bool = True) -> bool:
-    loc = page.get_by_text(text, exact=exact)
-    for i in range(await loc.count()):
-        item = loc.nth(i)
-        try:
-            if await item.is_visible():
-                await item.click(timeout=3000)
-                await page.wait_for_timeout(800)
-                return True
-        except Exception:
-            continue
+async def country_is_germany(page: Page) -> bool:
+    body = await page.locator("body").inner_text()
+    return bool(re.search(r"Shipping to\s+Germany", body, re.I))
+
+
+async def currency_is_eur(page: Page) -> bool:
+    body = await page.locator("body").inner_text()
+    return bool(re.search(r"Price,\s*EUR", body, re.I))
+
+
+async def click_visible_text(page: Page, text: str) -> bool:
+    for locator in (
+        page.get_by_text(text, exact=True),
+        page.get_by_role("button", name=text, exact=True),
+        page.get_by_role("option", name=text, exact=True),
+        page.get_by_role("link", name=text, exact=True),
+    ):
+        for i in range(await locator.count()):
+            item = locator.nth(i)
+            try:
+                if await item.is_visible():
+                    await item.click(timeout=3000)
+                    await page.wait_for_timeout(1000)
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+async def try_open_selects_until_germany(page: Page) -> bool:
+    # The Amayama page exposes the destination chooser as a generic "Select"
+    # control in some layouts. Try each visible one and look for Germany.
+    selectors = [
+        page.get_by_text("Select", exact=True),
+        page.get_by_role("button", name=re.compile(r"select", re.I)),
+        page.get_by_role("link", name=re.compile(r"select", re.I)),
+    ]
+    for group in selectors:
+        count = await group.count()
+        for i in range(count):
+            item = group.nth(i)
+            try:
+                if not await item.is_visible():
+                    continue
+                await item.click(timeout=2500)
+                await page.wait_for_timeout(500)
+                if await click_visible_text(page, "Germany"):
+                    await page.wait_for_timeout(1500)
+                    if await country_is_germany(page):
+                        return True
+                try:
+                    await page.keyboard.press("Escape")
+                except Exception:
+                    pass
+            except Exception:
+                continue
     return False
 
 
 async def set_country_germany(page: Page) -> None:
-    body = await page.locator("body").inner_text()
-    if re.search(r"Shipping to\s+Germany", body, re.I):
+    if await country_is_germany(page):
         return
 
-    # Native select, if Amayama exposes one in this layout.
-    if await select_native_option(page, "Germany"):
-        await page.wait_for_timeout(1200)
-        body = await page.locator("body").inner_text()
-        if re.search(r"Shipping to\s+Germany", body, re.I):
-            return
+    if await select_native_option(page, "Germany") and await country_is_germany(page):
+        return
 
-    # Current destination is rendered as clickable text/custom control on product pages.
+    body = await page.locator("body").inner_text()
     m = re.search(r"Shipping to\s+([^\n\[]+)", body, re.I)
-    current = m.group(1).strip() if m else None
-    opened = False
-    if current:
-        opened = await click_first_visible_text(page, current, exact=True)
-    if not opened:
-        # Fallback to a visible shipping selector/combobox.
-        combos = page.get_by_role("combobox")
-        for i in range(await combos.count()):
-            try:
-                if await combos.nth(i).is_visible():
-                    await combos.nth(i).click(timeout=2500)
-                    opened = True
-                    break
-            except Exception:
-                pass
+    if m:
+        current = m.group(1).strip()
+        if await click_visible_text(page, current):
+            if await click_visible_text(page, "Germany"):
+                await page.wait_for_timeout(1500)
+                if await country_is_germany(page):
+                    return
 
-    if opened:
-        if await click_first_visible_text(page, "Germany", exact=True):
-            await page.wait_for_timeout(1500)
-            body = await page.locator("body").inner_text()
-            if re.search(r"Shipping to\s+Germany", body, re.I):
-                return
+    if await try_open_selects_until_germany(page):
+        return
 
+    # Last resort: searchable country popup/input.
+    inputs = page.locator("input")
+    for i in range(await inputs.count()):
+        inp = inputs.nth(i)
+        try:
+            if not await inp.is_visible():
+                continue
+            placeholder = (await inp.get_attribute("placeholder") or "").lower()
+            aria = (await inp.get_attribute("aria-label") or "").lower()
+            if any(x in placeholder + " " + aria for x in ("country", "shipping", "destination", "search")):
+                await inp.fill("Germany")
+                await page.wait_for_timeout(500)
+                if await click_visible_text(page, "Germany"):
+                    await page.wait_for_timeout(1500)
+                    if await country_is_germany(page):
+                        return
+        except Exception:
+            pass
+
+    await save_debug(page, "country-selection-failed")
     raise RuntimeError("Could not set shipping country to Germany")
 
 
 async def set_currency_eur(page: Page) -> None:
-    body = await page.locator("body").inner_text()
-    if re.search(r"Price,\s*EUR", body, re.I):
+    if await currency_is_eur(page):
         return
-
-    if await select_native_option(page, "EUR"):
-        await page.wait_for_timeout(1000)
-        body = await page.locator("body").inner_text()
-        if re.search(r"Price,\s*EUR", body, re.I):
+    if await select_native_option(page, "EUR") and await currency_is_eur(page):
+        return
+    if await click_visible_text(page, "EUR"):
+        await page.wait_for_timeout(1200)
+        if await currency_is_eur(page):
             return
-
-    # Amayama exposes currency choices (USD/AUD/.../EUR) as clickable text in headers.
-    eur = page.get_by_text("EUR", exact=True)
-    for i in range(await eur.count()):
-        item = eur.nth(i)
-        try:
-            if await item.is_visible():
-                await item.click(timeout=3000)
-                await page.wait_for_timeout(1200)
-                body = await page.locator("body").inner_text()
-                if re.search(r"Price,\s*EUR", body, re.I):
-                    return
-        except Exception:
-            continue
-
+    await save_debug(page, "currency-selection-failed")
     raise RuntimeError("Could not set currency to EUR")
 
 
@@ -150,10 +210,9 @@ async def set_germany_eur(page: Page) -> None:
 
 
 async def verify_germany_eur(page: Page) -> None:
-    body = await page.locator("body").inner_text()
-    if not re.search(r"Shipping to\s+Germany", body, re.I):
+    if not await country_is_germany(page):
         raise RuntimeError("Shipping destination is not Germany")
-    if not re.search(r"Price,\s*EUR", body, re.I):
+    if not await currency_is_eur(page):
         raise RuntimeError("Displayed price currency is not EUR")
 
 
@@ -191,8 +250,9 @@ async def parse_offer_tables(page: Page) -> list[dict[str, Any]]:
             if price is None or not source:
                 continue
             offers.append({"source": " ".join(source.split()), "price": price, "currency": "EUR"})
-    deduped = []
-    seen = set()
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, float, str]] = set()
     for offer in offers:
         key = (offer["source"], offer["price"], offer["currency"])
         if key not in seen:
@@ -206,7 +266,6 @@ async def fetch_part(page: Page, brand: str, part_number: str, first: bool) -> d
     await accept_cookies(page)
     if first:
         await set_germany_eur(page)
-        await page.wait_for_timeout(1000)
     await verify_germany_eur(page)
     body = (await page.locator("body").inner_text()).lower()
     oop = 1 if "out of production" in body else 0
@@ -224,6 +283,9 @@ async def run(parts: list[str], brand: str, delay: float) -> dict[str, Any]:
                 result[part] = await fetch_part(page, brand, part, first=(idx == 0))
                 if idx < len(parts) - 1:
                     await asyncio.sleep(delay)
+        except Exception:
+            await save_debug(page, "run-failed")
+            raise
         finally:
             await browser.close()
     return result
@@ -242,7 +304,6 @@ def main() -> None:
     args = parser.parse_args()
     output = Path(args.output)
 
-    # Never leave stale data behind. A failed run must commit an empty JSON object.
     output.write_text("{}\n", encoding="utf-8")
     try:
         parts = read_parts(Path(args.input))
